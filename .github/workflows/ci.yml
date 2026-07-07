@@ -1,0 +1,52 @@
+name: CI
+
+# PR 作成・更新時と main への push 時にこのワークフローを実行する
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # テスト用 PostgreSQL サービスコンテナ
+    # ジョブ内の各ステップから localhost:5432 として接続できる
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        # コンテナが接続を受け付けられる状態になるまで待つ
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # リポジトリのコードをチェックアウトする
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Python 3.11 をセットアップする
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 依存パッケージをインストールする
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # pytest でテストを実行する
+      # DATABASE_URL でテスト用 PostgreSQL への接続先を渡す
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/testdb
+        run: pytest tests/ -v

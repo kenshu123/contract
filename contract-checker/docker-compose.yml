@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppassword
+      POSTGRES_DB: riskcheck
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d riskcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  my-app:
+    build: .
+    image: my-app:local
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql://appuser:apppassword@db:5432/riskcheck"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      API_KEY: "${API_KEY}"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:

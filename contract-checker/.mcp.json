@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "C:\\Claude\\contract-checker\\.venv\\Scripts\\postgres-mcp.exe",
+      "args": [
+        "postgresql://appuser:apppassword@localhost:5432/riskcheck",
+        "--access-mode=unrestricted"
+      ]
+    }
+  }
+}
