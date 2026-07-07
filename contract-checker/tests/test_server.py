@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 
 def make_client():
-    with patch("storage.get_db_connection"), \
+    with patch("storage._connect"), \
          patch("service.run_db"), \
          patch("app.auth.verify_api_key", return_value=None):
         from server import app
