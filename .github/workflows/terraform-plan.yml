@@ -1,0 +1,182 @@
+# infra/** または本ワークフロー自体が変更された PR でのみ実行される Terraform Plan ワークフロー。
+# staging 環境に対して plan を走らせ、結果を PR コメントとして投稿する。
+
+name: Terraform Plan
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - "terraform-*.yml"
+
+# OIDC トークン取得と PR コメント書き込みに必要な最小権限
+permissions:
+  id-token: write      # OIDC JWT の発行
+  contents: read       # リポジトリのチェックアウト
+  pull-requests: write # PR へのコメント投稿
+
+env:
+  TF_VERSION: "1.9.0"
+  # plan を実行する環境のリスト（複数環境に拡張したい場合はここに追加）
+  ENVIRONMENTS: "staging"
+
+jobs:
+  terraform-plan:
+    name: Plan / ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      # 一方の環境が失敗しても他の環境の結果も収集するために fail-fast を無効化
+      fail-fast: false
+      matrix:
+        environment: ["staging"]
+
+    # 環境ごとの plan 結果を後段の comment ジョブへ渡す
+    outputs:
+      plan_outcome: ${{ steps.plan.outcome }}
+
+    steps:
+      # ━━━ 1. ソースコードの取得 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ━━━ 2. Terraform CLI のセットアップ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # 指定バージョンの terraform を PATH に追加し、プラグインキャッシュも有効化する
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true   # 終了コードを GitHub Actions の step outcome に反映させる
+
+      # ━━━ 3. AWS OIDC 認証 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # 静的な IAM キーを使わず、GitHub OIDC トークンで一時クレデンシャルを取得する
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ap-northeast-1
+          role-session-name: terraform-plan-${{ matrix.environment }}-${{ github.run_id }}
+
+      # ━━━ 4. Terraform 初期化 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # プロバイダーのダウンロードとリモートバックエンドへの接続を行う
+      - name: Terraform Init
+        id: init
+        working-directory: infra/environments/${{ matrix.environment }}
+        run: terraform init -input=false
+
+      # ━━━ 5. 構文・設定の検証 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # plan の前に静的検証を実行し、早期にエラーを検出する
+      - name: Terraform Validate
+        id: validate
+        working-directory: infra/environments/${{ matrix.environment }}
+        run: terraform validate -no-color
+
+      # ━━━ 6. Terraform Plan ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # plan の出力をファイルに保存しつつ、テキスト形式でも取得する。
+      # continue-on-error: true にすることで plan が失敗してもコメントステップを実行できる。
+      - name: Terraform Plan
+        id: plan
+        working-directory: infra/environments/${{ matrix.environment }}
+        continue-on-error: true
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan.binary \
+            2>&1 | tee plan_output.txt
+
+          # plan コマンドのパイプ前の終了コードを保持する
+          exit ${PIPESTATUS[0]}
+
+      # ━━━ 7. plan テキストをステップ出力へ格納 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      # コメント本文が長すぎる場合は末尾を切り詰めて GitHub の制限（65535 bytes）に収める
+      - name: Read plan output
+        id: plan_output
+        if: always()
+        working-directory: infra/environments/${{ matrix.environment }}
+        run: |
+          OUTPUT=$(cat plan_output.txt 2>/dev/null || echo "(plan output not available)")
+          # GitHub Actions の setOutput は 65535 bytes が上限のため超過分を切り捨てる
+          MAX_LEN=60000
+          if [ ${#OUTPUT} -gt $MAX_LEN ]; then
+            OUTPUT="${OUTPUT:0:$MAX_LEN}"$'\n\n... (output truncated)'
+          fi
+          # 改行を含む文字列を multiline output として安全に渡す
+          {
+            echo "stdout<<EOF"
+            echo "$OUTPUT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ━━━ 8. PR にコメントを投稿（環境ごとに折りたたみ表示）━━━━━━━━━━━━━━━
+      # 既存の同名コメントがある場合は更新し、新規の場合は追加する。
+      # plan が失敗していても必ずコメントを投稿する（if: always()）。
+      - name: Post plan result to PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_STDOUT: ${{ steps.plan_output.outputs.stdout }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const environment = process.env.ENVIRONMENT;
+            const outcome     = process.env.PLAN_OUTCOME;
+            const planOutput  = process.env.PLAN_STDOUT;
+
+            const statusIcon  = outcome === 'success' ? '✅' : '❌';
+            const marker      = `<!-- terraform-plan:${environment} -->`; // 更新時の識別子
+
+            const body = [
+              marker,
+              `## ${statusIcon} Terraform Plan — \`${environment}\``,
+              '',
+              `| | |`,
+              `|---|---|`,
+              `| **Environment** | \`${environment}\` |`,
+              `| **Outcome** | \`${outcome}\` |`,
+              `| **Triggered by** | @${context.actor} |`,
+              `| **Workflow run** | [#${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) |`,
+              '',
+              '<details>',
+              `<summary>📋 Plan output（クリックで展開）</summary>`,
+              '',
+              '```hcl',
+              planOutput,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            // 同じ環境の既存コメントを検索して更新する（なければ新規作成）
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # ━━━ 9. plan 失敗時にジョブを明示的に失敗させる ━━━━━━━━━━━━━━━━━━━━━
+      # continue-on-error で吸収した plan の失敗をここで再度エラーとして伝播させる
+      - name: Fail job if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "::error::Terraform plan failed for environment '${{ matrix.environment }}'. See PR comment for details."
+          exit 1
