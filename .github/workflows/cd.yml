@@ -1,0 +1,68 @@
+name: CD — Build & Deploy to ECS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "app/**" # app/ 以下のファイルが変更されたときだけ実行
+
+permissions:
+  id-token: write # OIDC トークン取得に必要
+  contents: read
+
+jobs:
+  deploy:
+    name: Build, Push, and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # ソースコードを取得
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # OIDC で AWS 認証（シークレットにアクセスキーを置かずに済む）
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-northeast-1
+
+      # ECR への docker login（認証トークンを取得して Docker に渡す）
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Docker イメージをビルドして ECR にプッシュ
+      # タグにコミット SHA を使うことでデプロイ履歴を追跡できる
+      - name: Build and push Docker image
+        env:
+          ECR_REPOSITORY_URL: ${{ secrets.ECR_REPOSITORY_URL }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_REPOSITORY_URL:$IMAGE_TAG" ./app
+          docker push "$ECR_REPOSITORY_URL:$IMAGE_TAG"
+
+      # ECS サービスをローリング更新
+      # --force-new-deployment により新しいタスク定義がなくても強制的に再デプロイされる
+      - name: Deploy to ECS (rolling update)
+        env:
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER_NAME }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE_NAME }}
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --region ap-northeast-1
+
+      # デプロイが安定するまで待機（タイムアウトは 10 分）
+      - name: Wait for ECS service to stabilize
+        env:
+          ECS_CLUSTER: ${{ secrets.ECS_CLUSTER_NAME }}
+          ECS_SERVICE: ${{ secrets.ECS_SERVICE_NAME }}
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region ap-northeast-1
