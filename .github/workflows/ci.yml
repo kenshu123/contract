@@ -42,11 +42,11 @@ jobs:
 
       # 依存パッケージをインストールする
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r contract-checker/requirements.txt
 
       # pytest でテストを実行する
       # DATABASE_URL でテスト用 PostgreSQL への接続先を渡す
       - name: Run tests
         env:
           DATABASE_URL: postgresql://postgres:testpass@localhost:5432/testdb
-        run: pytest tests/ -v
+        run: pytest contract-checker/tests/ -v
